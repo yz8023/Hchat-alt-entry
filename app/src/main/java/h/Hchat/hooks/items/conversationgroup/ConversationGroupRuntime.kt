@@ -1649,25 +1649,37 @@ object ConversationGroupRuntime {
         val database = WeChatApis.database() ?: return
         val prefs = HchatStorage.preferences(context, ConversationGroupStore.PREFS_NAME)
         val originals = loadOriginalParentRefs(prefs, account)
-        var groups = ConversationGroupStore.load(context)
         val enabled = ConversationGroupStore.isEnabled(context)
         if (!enabled) {
             synchronized(lifecycleLock) {
                 if (!isRuntimeGenerationActive(generation)) return
                 effectiveConversationSnapshot = null
             }
-            ConversationGroupHomeProjection.refresh()
-            val state = loadConversationParents(database, emptySet())
-            val official = state.officialIds(originals)
-            val plan = ConversationGroupParentPolicy.plan(
-                assigned = state.parents.filterKeys { it !in official },
-                current = state.parents,
-                protected = official,
-                originals = originals
-            )
-            applyParentPlan(database, prefs, account, plan)
+            try {
+                val state = loadConversationParents(database, emptySet())
+                val plan = ConversationGroupParentPolicy.plan(
+                    assigned = emptyMap(),
+                    current = state.parents,
+                    protected = emptySet(),
+                    originals = originals
+                )
+                if (!isRuntimeGenerationActive(generation)) return
+                val parentUpdatesSucceeded = applyParentPlan(database, prefs, account, plan)
+                // Keep virtual parents until every real conversation has been restored.
+                if (plan.unresolved.isEmpty() && parentUpdatesSucceeded.containsAll(plan.updates.keys) &&
+                    isRuntimeGenerationActive(generation) && ConversationGroupStore.accountKey() == account &&
+                    !ConversationGroupStore.isEnabled(context)
+                ) {
+                    cleanupVirtualRows(database, emptySet())
+                }
+            } finally {
+                if (isRuntimeGenerationActive(generation) && ConversationGroupStore.accountKey() == account) {
+                    ConversationGroupHomeProjection.refresh()
+                }
+            }
             return
         }
+        var groups = ConversationGroupStore.load(context)
         val automaticResolution = if (enabled) {
             ConversationGroupAutomaticResolver.resolveForSync(context, groups)
         } else null
@@ -2086,7 +2098,7 @@ object ConversationGroupRuntime {
                 "SELECT username FROM $table WHERE username LIKE ?",
                 arrayOf("$VIRTUAL_PREFIX%")
             ).forEach { row ->
-                value(row, "username").takeIf(String::isNotBlank)?.let(existing::add)
+                value(row, "username").takeIf(::isVirtualTalker)?.let(existing::add)
             }
         }
         (existing - desiredTalkers).forEach { talker ->
